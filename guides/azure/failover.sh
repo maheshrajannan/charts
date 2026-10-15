@@ -449,6 +449,51 @@ forget_writer_only_resources() {
   guard_other_changes "$others"
 }
 
+# explain_failed_rebuild runs when the rebuild apply fails part-way. Azure can
+# return an error after it has accepted the new server: a 404 on the PATCH that
+# follows the create, while the replica is still being built. Terraform then
+# marks the server tainted, and the next apply destroys it again even though
+# Azure finished creating it. This names the tainted servers and the safe way
+# back, rather than leaving the next `make apply` to repeat a 10-15 minute
+# rebuild.
+explain_failed_rebuild() {
+  # `terraform state show` heads a tainted instance with "(tainted)"; the JSON
+  # state output has no field for it.
+  local tainted="" address state rg name
+  state="$(terraform -chdir="$TF_DIR" show -json 2>/dev/null || true)"
+  while IFS= read -r address; do
+    [[ -n "$address" ]] || continue
+    if terraform -chdir="$TF_DIR" state show "$address" 2>/dev/null | head -1 | grep -q '(tainted)'; then
+      rg="$(jq -r --arg a "$address" '[.. | objects | select(.address? == $a) | .values.resource_group_name] | first // ""' <<<"$state")"
+      name="$(jq -r --arg a "$address" '[.. | objects | select(.address? == $a) | .values.name] | first // ""' <<<"$state")"
+      tainted+="${address}"$'\t'"${rg}"$'\t'"${name}"$'\n'
+    fi
+  done < <(terraform -chdir="$TF_DIR" state list 2>/dev/null | grep '^azurerm_postgresql_flexible_server\.' || true)
+  tainted="${tainted%$'\n'}"
+  [[ -n "$tainted" ]] || return 0
+
+  echo >&2
+  echo "The rebuild failed after Azure started creating the new servers." >&2
+  echo "Terraform has marked these tainted, so the next apply would destroy them again:" >&2
+  while IFS=$'\t' read -r address rg name; do
+    echo "    ${address}  (${name})" >&2
+  done <<<"$tainted"
+  echo >&2
+  echo "Do not re-run 'follow' or 'make apply' yet. Check each server in Azure first:" >&2
+  while IFS=$'\t' read -r address rg name; do
+    echo "    az postgres flexible-server show -g ${rg} -n ${name} --query '{state:state,role:replicationRole}' -o table" >&2
+  done <<<"$tainted"
+  echo >&2
+  echo "Ready with a replica role (GeoAsyncReplica): the server is fine. Untaint it," >&2
+  echo "then plan; the plan should show no destroys:" >&2
+  while IFS=$'\t' read -r address rg name; do
+    echo "    terraform -chdir=${TF_DIR} untaint '${address}'" >&2
+  done <<<"$tainted"
+  echo "    make plan LOCATION=${LOCATION} REGION_INGRESS_ENDPOINT=${INGRESS_ENDPOINT}" >&2
+  echo >&2
+  echo "Still provisioning: wait, then check again. Missing or failed: re-run follow." >&2
+}
+
 cmd_follow() {
   require_failover_args
 
@@ -531,7 +576,10 @@ cmd_follow() {
 
   forget_writer_only_resources "$plan" "${replace_args[@]+"${replace_args[@]}"}"
 
-  terraform -chdir="$TF_DIR" apply "$PLAN_FILE"
+  if ! terraform -chdir="$TF_DIR" apply "$PLAN_FILE"; then
+    explain_failed_rebuild
+    exit 1
+  fi
 
   echo
   echo "Rebuilt as replicas. Let them catch up before promoting back — a promotion"
